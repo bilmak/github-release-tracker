@@ -4,13 +4,16 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/bilmak/github-release-notifier/internal/handler"
+	"github.com/bilmak/github-release-notifier/internal/repo"
 )
 
 func main() {
 	mux := http.NewServeMux()
-	hand := handler.New()
+	gh := repo.NewClient(os.Getenv("GITHUB_TOKEN"))
+	hand := handler.New(gh)
 	mux.HandleFunc("POST /api/subscribe", hand.Subscribe)
 	mux.HandleFunc("/health", healthHandler)
 	log.Println("Server running on :8080")

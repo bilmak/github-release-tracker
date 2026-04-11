@@ -7,11 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"regexp"
+	"net/mail"
 	"strings"
 
 	"github.com/bilmak/github-release-notifier/internal/domain"
 	"github.com/bilmak/github-release-notifier/internal/repo"
+	"github.com/bilmak/github-release-notifier/pkg/github"
 )
 
 type GitHubInter interface {
@@ -21,6 +22,7 @@ type SubscriptionStorage interface {
 	SaveSubscription(ctx context.Context, sub domain.Subscription) error
 	ConfirmSubscription(ctx context.Context, token string) error
 	Unsubscribe(ctx context.Context, token string) error
+	GetSubscriptionsByEmail(ctx context.Context, email string) ([]domain.Subscription, error)
 }
 type EmailInter interface {
 	SendConfirmation(to, token string) error
@@ -36,23 +38,24 @@ func New(gh GitHubInter, st SubscriptionStorage, em EmailInter) *Handler {
 }
 
 func (h *Handler) Subscribe(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1048576) // 1MB limit
 	var req domain.SubscribeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 		return
 	}
-	if !emailRegex.MatchString(req.Email) {
+	if !isEmailValid(req.Email) {
 		http.Error(w, `{"error":"invalid email format"}`,
 			http.StatusBadRequest)
 		return
 	}
-	if !isValid(req.Repo) {
+	if !isRepoValid(req.Repo) {
 		http.Error(w, `{"error":"invalid repo format"}`, http.StatusBadRequest)
 		return
 	}
 	exist, err := h.github.RepoExists(r.Context(), req.Repo)
 	if err != nil {
-		if errors.Is(err, repo.ErrRateLimit) {
+		if errors.Is(err, github.ErrRateLimit) {
 			http.Error(w, `{"error":"GitHub API rate limit exceeded"}`,
 				http.StatusTooManyRequests)
 			return
@@ -73,6 +76,10 @@ func (h *Handler) Subscribe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.storage.SaveSubscription(r.Context(), sub); err != nil {
+		if strings.Contains(err.Error(), "duplicate key") || strings.Contains(err.Error(), "UNIQUE constraint") {
+			http.Error(w, `{"error":"already subscribed to this repository"}`, http.StatusConflict)
+			return
+		}
 		http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
 		return
 	}
@@ -90,7 +97,7 @@ func (h *Handler) Subscribe(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Confirm(w http.ResponseWriter, r *http.Request) {
-	token := r.URL.Query().Get("token")
+	token := r.PathValue("token")
 	if token == "" {
 		http.Error(w, `{"error":"missing token"}`, http.StatusBadRequest)
 		return
@@ -110,7 +117,7 @@ func (h *Handler) Confirm(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Unsubscribe(w http.ResponseWriter, r *http.Request) {
-	token := r.URL.Query().Get("token")
+	token := r.PathValue("token")
 	if token == "" {
 		http.Error(w, `{"error":"missing token"}`, http.StatusBadRequest)
 		return
@@ -130,11 +137,49 @@ func (h *Handler) Unsubscribe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-var emailRegex = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
+type subscriptionResponse struct {
+	Email       string `json:"email"`
+	Repo        string `json:"repo"`
+	Confirmed   bool   `json:"confirmed"`
+	LastSeenTag string `json:"last_seen_tag"`
+}
 
-func isValid(repo string) bool {
+func (h *Handler) GetSubscriptions(w http.ResponseWriter, r *http.Request) {
+	email := r.URL.Query().Get("email")
+	if !isEmailValid(email) {
+		http.Error(w, `{"error":"invalid email"}`, http.StatusBadRequest)
+		return
+	}
+	subs, err := h.storage.GetSubscriptionsByEmail(r.Context(), email)
+	if err != nil {
+		http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
+		return
+	}
+	result := make([]subscriptionResponse, len(subs))
+	for i, sub := range subs {
+		result[i] = subscriptionResponse{
+			Email:       sub.Email,
+			Repo:        sub.Repo,
+			Confirmed:   sub.Confirmed,
+			LastSeenTag: sub.LastSeenTag,
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+func isRepoValid(repo string) bool {
 	parts := strings.Split(repo, "/")
 	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
+}
+
+func isEmailValid(address string) bool {
+	_, err := mail.ParseAddress(address)
+	if err != nil {
+		return false
+	}
+	return true
+
 }
 
 func generateToken() string {
